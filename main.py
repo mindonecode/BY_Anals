@@ -1,38 +1,60 @@
+import os
+import argparse
+import datetime
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from sklearn.preprocessing import MinMaxScaler
-import matplotlib.pyplot as plt
-from pathlib import Path
+import holidays
+import joblib
+
 from db import get_connection
 from psycopg2.extras import execute_batch
-import argparse
 
-# 숫자 자릿수 정제
-def clamp_numeric(val, max_abs=9999.99, scale=2):
-    if val is None or pd.isna(val):
-        return None
-    val = round(float(val), scale)
-    if val > max_abs:
-        return max_abs
-    if val < -max_abs:
-        return -max_abs
-    return val
+
+# =========================
+# 기본 설정
+# =========================
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+np.random.seed(42)
+tf.random.set_seed(42)
+
+BASE_DIR = Path(__file__).resolve().parent
+
+MODEL_DIR = BASE_DIR / "models"
+
+
+# =========================
+# Argument
+# =========================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="AI analysis batch")
+
+    parser = argparse.ArgumentParser(
+        description="AI Leak Analysis Prediction"
+    )
+
+    parser.add_argument(
+        "--schema",
+        required=True,
+        help="database schema"
+    )
 
     parser.add_argument(
         "--start-date",
-        required=False,
+        required=True,
         help="analysis start date (YYYY-MM-DD)"
     )
+
     parser.add_argument(
         "--end-date",
-        required=False,
+        required=True,
         help="analysis end date (YYYY-MM-DD)"
     )
-    parser.add_argument("--schema", required=False)
+
     parser.add_argument(
         "--blck-cd",
         required=False,
@@ -41,35 +63,33 @@ def parse_args():
 
     return parser.parse_args()
 
-import os
-print("DB_HOST =", os.getenv("DB_HOST"))
-print("DB_PORT =", os.getenv("DB_PORT"))
-print("DB_NAME =", os.getenv("DB_NAME"))
-print("DB_USER =", os.getenv("DB_USER"))
 
-import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+# =========================
+# 숫자 자릿수 정제
+# =========================
 
-import matplotlib
-matplotlib.use("Agg")
+def clamp_numeric(val, max_abs=9999.99, scale=2):
 
-IS_BATCH = True
+    if val is None or pd.isna(val):
+        return None
 
-BASE_DIR = Path(__file__).resolve().parent
-INPUT_DIR = BASE_DIR / "input"
-OUTPUT_DIR = BASE_DIR / "output"
+    val = round(float(val), scale)
 
-INPUT_FILE = INPUT_DIR / "BY7a.csv"
-OUTPUT_FILE = OUTPUT_DIR / "BY7-a_result.csv"
+    if val > max_abs:
+        return max_abs
 
-np.random.seed(42)
-tf.random.set_seed(42)
+    if val < -max_abs:
+        return -max_abs
 
-# 데이터 불러오기
-# 기존 엑셀 읽기
-#data = pd.read_csv(INPUT_FILE)
+    return val
 
-def load_source_data(start_dt, end_dt, blck_cd=None):
+
+# =========================
+# DB Load
+# =========================
+
+def load_source_data(schema, start_dt, end_dt, blck_cd=None):
+
     sql = f"""
         SELECT
             dt as "time",
@@ -77,362 +97,727 @@ def load_source_data(start_dt, end_dt, blck_cd=None):
             flow,
             temp as "temperature",
             rcvr_yn AS "leak_recovery"
-        FROM {SCHEMA}.ai_anals_input
-        WHERE dt >= %s and dt <= %s
+        FROM {schema}.ai_anals_input
+        WHERE dt >= %s
+          AND dt <= %s
     """
 
     params = [start_dt, end_dt]
 
     if blck_cd:
-        sql+=" AND blck_cd =  %s"
+        sql += """
+          AND blck_cd = %s
+        """
         params.append(blck_cd)
 
-    sql += " ORDER BY blck_cd, dt"
+    sql += """
+        ORDER BY blck_cd, dt
+    """
 
-    start_dt = pd.to_datetime(start_dt)
-    end_dt = pd.to_datetime(end_dt)
     conn = get_connection()
+
     try:
-        df = pd.read_sql(sql, conn, params=params)
+        df = pd.read_sql(
+            sql,
+            conn,
+            params=params
+        )
     finally:
         conn.close()
 
     return df
 
-def save_results(df):
-    sql = f"""
-        merge into {SCHEMA}.ai_anals_output t
-        using (
-            select
-                %s::timestamp as time,
-                %s::varchar as blck_cd,
-                %s::numeric as actual_flow,
-                %s::numeric as predicted_flow,
-                %s::numeric as weighted_error
-        ) s
-        on (t.dt = s.time and t.blck_cd = s.blck_cd)
-        when matched then
-            update set
-                actual_flow = s.actual_flow,
-                predicted_flow = s.predicted_flow,
-                weighted_error = s.weighted_error
-        when not matched then
-            insert (dt, blck_cd, actual_flow, predicted_flow, weighted_error)
-            values (s.time, s.blck_cd, s.actual_flow, s.predicted_flow, s.weighted_error)
-    """
 
-    rows = df[['Time', 'blck_cd', 'Actual Flow', 'Predicted Flow', 'Weighted Error']].values.tolist()
+# =========================
+# 전처리
+# =========================
 
-    conn = get_connection()
-    with conn:
-        with conn.cursor() as cur:
-            execute_batch(cur, sql, rows)
-
-    conn.close()
-
-# db가져오기
-args = parse_args()
-
-#START_DATE = args.start_date
-#END_DATE = args.end_date
-#SCHEMA = args.schema
-#BLCK_CD = args.blck_cd
-
-START_DATE = "2024-01-01"
-END_DATE = "2025-08-13"
-SCHEMA = "by_schema"
-BLCK_CD = "BL000045"
-
-data = load_source_data(START_DATE, END_DATE, BLCK_CD)
-
-data = data.rename(columns={
-    'leak_recovery': 'leak_recovery'
-})
-
-# 데이터 전처리 함수
 def preprocess_data(data):
+
+    data = data.copy()
+
     data['time'] = pd.to_datetime(data['time'])
+
     data['hour'] = data['time'].dt.hour
     data['day_of_week'] = data['time'].dt.dayofweek
     data['month'] = data['time'].dt.month
     data['date'] = data['time'].dt.date
 
+    data['is_weekend'] = (
+        data['day_of_week'] >= 5
+    ).astype(int)
+
+    kr_holidays = holidays.KR()
+
+    data['is_holiday'] = data['date'].apply(
+        lambda x: 1 if x in kr_holidays else 0
+    )
+
+    daily_temp = data.groupby(
+        ['blck_cd', 'date']
+    )['temperature'].agg(
+        tmax='max',
+        tmin='min'
+    ).reset_index()
+
+    data = data.merge(
+        daily_temp,
+        on=['blck_cd', 'date'],
+        how='left'
+    )
+
     data = data[
-        ['time', 'blck_cd', 'flow', 'temperature', 'leak_recovery', 'hour', 'day_of_week', 'month', 'date']
+        [
+            'time',
+            'blck_cd',
+            'flow',
+            'temperature',
+            'leak_recovery',
+            'tmax',
+            'tmin',
+            'hour',
+            'day_of_week',
+            'is_weekend',
+            'is_holiday',
+            'month',
+            'date'
+        ]
     ]
 
     return data
 
 
-data = preprocess_data(data)
+# =========================
+# 스케일러 적용
+# =========================
 
-# 데이터 분할
-split_time = pd.to_datetime(END_DATE) - pd.Timedelta(days=1)
-train_data = data
-test_data = data
+def apply_scaler(data, scaler):
 
+    scaled_data = data.copy()
 
-# 데이터 스케일링
-def scale_features(train_data, test_data):
-    scaler = MinMaxScaler()
-    scaled_train = train_data.copy()
-    scaled_test = test_data.copy()
-
-    scaled_train[['flow', 'temperature', 'leak_recovery']] = scaler.fit_transform(
-        train_data[['flow', 'temperature', 'leak_recovery']])
-    scaled_test[['flow', 'temperature', 'leak_recovery']] = scaler.transform(
-        test_data[['flow', 'temperature', 'leak_recovery']])
-
-    return scaled_train, scaled_test, scaler
-
-
-scaled_train_data, scaled_test_data, scaler = scale_features(train_data, test_data)
-
-
-# 시퀀스 생성
-def create_sequences(data, sequence_length=24):
-    all_sequences = []
-    all_targets = []
-    all_times = []
-    all_blck_cds = []
-
-    for blck_cd, g in data.groupby("blck_cd"):
-        g = g.sort_values("time").reset_index(drop=True)
-
-        if len(g) <= sequence_length:
-            continue
-
-        for i in range(len(g) - sequence_length):
-            seq = g.iloc[i:i + sequence_length]
-            target = g.iloc[i + sequence_length]['flow']
-
-            all_sequences.append(
-                seq[['flow', 'temperature', 'hour', 'day_of_week', 'month', 'leak_recovery']].values
-            )
-            all_targets.append(target)
-            all_times.append(g.iloc[i + sequence_length]['time'])
-            all_blck_cds.append(blck_cd)
-
-    return (
-        np.array(all_sequences),
-        np.array(all_targets),
-        pd.Series(all_times),
-        pd.Series(all_blck_cds)
+    scaled_data[
+        ['flow', 'tmax', 'tmin']
+    ] = scaler.transform(
+        data[
+            ['flow', 'tmax', 'tmin']
+        ]
     )
 
-sequence_length = 24
-X_train, y_train, times_train, blck_cds_train = create_sequences(scaled_train_data, sequence_length)
-X_test, y_test, times_test, blck_cds_test = create_sequences(scaled_test_data, sequence_length)
-
-dates_train = pd.to_datetime(times_train).dt.date
-dates_test = pd.to_datetime(times_test).dt.date
+    return scaled_data
 
 
-print("X_train shape:", X_train.shape)
-print(
-    data.groupby("blck_cd")
-        .size()
-        .sort_values()
-)
+# =========================
+# 직전 7일 시퀀스 생성
+# =========================
 
-# 누수 복구 데이터 증강
-def augment_leak_recovery_data(data, sequence_length):
-    augmented_data = data.copy()
+def create_sequences_prev_7_days(data):
 
-    leak_recovery_indices = augmented_data[augmented_data['leak_recovery'] == 1].index
+    sequences = []
+    targets = []
+    times = []
+    dates = []
+    blck_cds = []
 
-    for idx in leak_recovery_indices:
-        start_idx = max(idx - (sequence_length * 24 * 7), 0)
-        end_idx = min(idx + (sequence_length * 24 * 7), len(augmented_data))
+    daily_sequences = {}
 
-        pre_recovery_window = augmented_data.iloc[start_idx:idx]
-        post_recovery_window = augmented_data.iloc[idx:end_idx]
+    for (blck_cd, current_date), group in data.groupby(
+        ['blck_cd', 'date']
+    ):
 
-        pre_recovery_min_avg = pre_recovery_window['flow'].min()
-        post_recovery_min_avg = post_recovery_window['flow'].min()
+        group = group.sort_values('time').copy()
 
-        flow_difference = pre_recovery_min_avg - post_recovery_min_avg
-        if flow_difference > 0:
-            post_recovery_window['flow'] += flow_difference
+        group['hour_key'] = group[
+            'time'
+        ].dt.strftime('%Y-%m-%d %H')
 
-        augmented_data = pd.concat([augmented_data, post_recovery_window], ignore_index=True)
+        group = group.drop_duplicates(
+            subset=['hour_key']
+        )
 
-    return augmented_data
+        group = group.drop(
+            columns=['hour_key']
+        )
+
+        if len(group) == 24:
+
+            daily_sequences[
+                (blck_cd, current_date)
+            ] = group[
+                [
+                    'flow',
+                    'tmax',
+                    'tmin',
+                    'hour',
+                    'day_of_week',
+                    'is_weekend',
+                    'is_holiday',
+                    'month'
+                ]
+            ].values
+
+    for _, row in data.iterrows():
+
+        target_time = row['time']
+        target_date = row['date']
+        target_hour = row['hour']
+        target_flow = row['flow']
+        blck_cd = row['blck_cd']
+
+        valid_7_days = True
+        prev_7_days_seqs = []
+
+        for d in range(7, 0, -1):
+
+            p_date = target_date - pd.Timedelta(days=d)
+            key = (blck_cd, p_date)
+
+            if key in daily_sequences:
+
+                prev_7_days_seqs.append(
+                    daily_sequences[key]
+                )
+
+            else:
+
+                valid_7_days = False
+                break
+
+        if valid_7_days:
+
+            combined_prev_7_days = np.vstack(
+                prev_7_days_seqs
+            )
+
+            scaled_target_hour = target_hour / 23.0
+
+            target_hour_array = np.full(
+                (168, 1),
+                scaled_target_hour
+            )
+
+            seq_with_target_hint = np.hstack(
+                (
+                    combined_prev_7_days,
+                    target_hour_array
+                )
+            )
+
+            sequences.append(seq_with_target_hint)
+            targets.append(target_flow)
+            times.append(target_time)
+            dates.append(target_date)
+            blck_cds.append(blck_cd)
+
+    return (
+        np.array(sequences),
+        np.array(targets),
+        pd.Series(times).reset_index(drop=True),
+        pd.Series(dates).reset_index(drop=True),
+        pd.Series(blck_cds).reset_index(drop=True)
+    )
 
 
-# 증강된 데이터 생성
-augmented_train_data = augment_leak_recovery_data(train_data, sequence_length)
+# =========================
+# 역스케일링
+# =========================
 
-# 증강된 데이터 스케일링 및 시퀀스 생성
-augmented_scaled_train_data, _, _ = scale_features(augmented_train_data, test_data)
-X_augmented_train, y_augmented_train, _, _ = create_sequences(augmented_scaled_train_data, sequence_length)
+def inverse_scale_flow(scaler, scaled_values):
 
+    expanded = np.concatenate(
+        [
+            scaled_values,
+            np.zeros((scaled_values.shape[0], 2))
+        ],
+        axis=1
+    )
 
-# 모델 정의
-def build_model(input_shape):
-    model = tf.keras.Sequential([
-        tf.keras.layers.LSTM(64, return_sequences=True, input_shape=input_shape),
-        tf.keras.layers.LSTM(32),
-        tf.keras.layers.Dense(16, activation='relu'),
-        tf.keras.layers.Dense(1)
-    ])
-    model.compile(optimizer=tf.keras.optimizers.RMSprop(), loss='mean_squared_error')
-    return model
+    inversed = scaler.inverse_transform(
+        expanded
+    )[:, 0]
 
-
-# 모델 학습 설정
-model = build_model((sequence_length, X_train.shape[2]))
-
-early_stop = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
-
-# 모델 학습
-history = model.fit(
-    X_augmented_train, y_augmented_train,
-    epochs=50,
-    batch_size=32,
-    validation_split=0.1,
-    callbacks=[early_stop]
-)
-
-# 예측 수행
-y_pred = model.predict(X_test)
-
-
-# 스케일 역변환
-def inverse_scale(scaler, scaled_values):
-    expanded = np.concatenate([scaled_values, np.zeros((scaled_values.shape[0], 2))], axis=1)
-    inversed = scaler.inverse_transform(expanded)[:, 0]
     return inversed
 
 
-y_train_inversed = inverse_scale(scaler, y_train.reshape(-1, 1))
-y_test_inversed = inverse_scale(scaler, y_test.reshape(-1, 1))
-y_pred_inversed = inverse_scale(scaler, y_pred)
+# =========================
+# 일자별 가중 오차율 계산
+# =========================
 
-# 결과 데이터프레임 생성
-results = pd.DataFrame({
-    'Time': times_test.reset_index(drop=True),
-    'Date': dates_test.reset_index(drop=True),
-    'blck_cd': blck_cds_test.reset_index(drop=True),
-    'Actual Flow': y_test_inversed,
-    'Predicted Flow': y_pred_inversed
-})
-
-
-# 날짜별 평가지표 계산
 def calculate_datewise_metrics(results):
+
     datewise_metrics = {}
 
-    for date, group in results.groupby('Date'):
+    for (blck_cd, date), group in results.groupby(
+        ['blck_cd', 'Date']
+    ):
+
         actuals = group['Actual Flow'].values
         predictions = group['Predicted Flow'].values
         hours = group['Time'].dt.hour.values
 
-        mask = actuals != 0
+        # 고객 원본 기준:
+        # 실제 유량이 예측 유량보다 큰 경우만 오차 계산
+        mask = actuals > predictions
+
         if not np.any(mask):
-            datewise_metrics[date] = 0.0
+            datewise_metrics[(blck_cd, date)] = 0.0
             continue
 
         actuals = actuals[mask]
         predictions = predictions[mask]
         hours = hours[mask]
 
-        percentage_errors = np.abs((actuals - predictions) / actuals) * 100
+        valid_mask = actuals != 0
 
-        # 혹시라도 안전장치(필요하면 유지)
-        if percentage_errors.size == 0:
-            datewise_metrics[date] = 0.0
+        if not np.any(valid_mask):
+            datewise_metrics[(blck_cd, date)] = 0.0
             continue
 
-        weights = np.full(percentage_errors.shape, 0.2 / 21, dtype=float)
+        actuals = actuals[valid_mask]
+        predictions = predictions[valid_mask]
+        hours = hours[valid_mask]
+
+        percentage_errors = np.abs(
+            (actuals - predictions) / actuals
+        ) * 100
+
+        if percentage_errors.size == 0:
+            datewise_metrics[(blck_cd, date)] = 0.0
+            continue
+
+        weights = np.full(
+            percentage_errors.shape,
+            0.2 / 21,
+            dtype=float
+        )
 
         peak_hours = [2, 3, 4]
-        peak_mask = np.isin(hours, list(peak_hours))
+        peak_mask = np.isin(hours, peak_hours)
 
         weights[peak_mask] = 0.8 / 3
 
-        weighted_error = float(np.sum(percentage_errors * weights))
-        datewise_metrics[date] = weighted_error
+        weighted_error = float(
+            np.sum(percentage_errors * weights)
+        )
 
-    return pd.DataFrame({
-        'Date': list(datewise_metrics.keys()),
-        'Weighted Error': list(datewise_metrics.values())
+        datewise_metrics[(blck_cd, date)] = weighted_error
+
+    return pd.DataFrame([
+        {
+            'blck_cd': k[0],
+            'Date': k[1],
+            'Weighted Error': v
+        }
+        for k, v in datewise_metrics.items()
+    ])
+
+
+# =========================
+# 누수 가능성 판단
+# =========================
+
+def add_leak_probability_with_reasoning(metrics_df):
+
+    metrics_df = metrics_df.sort_values(
+        ['blck_cd', 'Date']
+    ).reset_index(drop=True)
+
+    metrics_df['Leak Probability'] = '데이터부족'
+    metrics_df['Reasoning'] = '과거 데이터 부족으로 분석할 수 없습니다.'
+    metrics_df['Upper Bound'] = np.nan
+    metrics_df['Is Anomaly'] = False
+
+    for idx, row in metrics_df.iterrows():
+
+        blck_cd = row['blck_cd']
+        current_date = row['Date']
+        current_error = row['Weighted Error']
+
+        start_date = current_date - datetime.timedelta(days=90)
+        end_date = current_date - datetime.timedelta(days=1)
+
+        past_3_months = metrics_df[
+            (metrics_df['blck_cd'] == blck_cd)
+            & (metrics_df['Date'] >= start_date)
+            & (metrics_df['Date'] <= end_date)
+        ]
+
+        if len(past_3_months) == 0:
+            continue
+
+        errors = past_3_months[
+            'Weighted Error'
+        ].dropna().values
+
+        if len(errors) == 0:
+            continue
+
+        threshold_90th = np.percentile(
+            errors,
+            90
+        )
+
+        filtered_errors = errors[
+            errors <= threshold_90th
+        ]
+
+        if len(filtered_errors) == 0:
+            continue
+
+        upper_bound = float(
+            np.mean(filtered_errors)
+            + np.std(filtered_errors)
+        )
+
+        metrics_df.at[idx, 'Upper Bound'] = upper_bound
+
+        if current_error > upper_bound:
+
+            metrics_df.at[idx, 'Leak Probability'] = '높음'
+            metrics_df.at[idx, 'Is Anomaly'] = True
+            metrics_df.at[idx, 'Reasoning'] = (
+                f"당일 오차율({current_error:.1f}%)이 "
+                f"과거 3개월 정상 상한선({upper_bound:.1f}%)을 초과했습니다."
+            )
+
+        else:
+
+            metrics_df.at[idx, 'Leak Probability'] = '낮음'
+            metrics_df.at[idx, 'Is Anomaly'] = False
+            metrics_df.at[idx, 'Reasoning'] = (
+                f"당일 오차율({current_error:.1f}%)이 "
+                f"정상 범위({upper_bound:.1f}% 이하) 내에 있어 안정적입니다."
+            )
+
+    return metrics_df
+
+
+# =========================
+# 결과 저장
+# =========================
+
+def save_results(schema, df):
+
+    if df.empty:
+        return 0
+
+    sql = f"""
+        MERGE INTO {schema}.ai_anals_output t
+        USING (
+            SELECT
+                %s::timestamp AS dt,
+                %s::varchar AS blck_cd,
+                %s::numeric AS actual_flow,
+                %s::numeric AS predicted_flow,
+                %s::numeric AS weighted_error,
+                %s::varchar AS leak_probability,
+                %s::text AS reasoning,
+                %s::numeric AS upper_bound,
+                %s::boolean AS is_anomaly
+        ) s
+        ON (
+            t.dt = s.dt
+            AND t.blck_cd = s.blck_cd
+        )
+        WHEN MATCHED THEN
+            UPDATE SET
+                actual_flow = s.actual_flow,
+                predicted_flow = s.predicted_flow,
+                weighted_error = s.weighted_error,
+                leak_probability = s.leak_probability,
+                reasoning = s.reasoning,
+                upper_bound = s.upper_bound,
+                is_anomaly = s.is_anomaly
+        WHEN NOT MATCHED THEN
+            INSERT (
+                dt,
+                blck_cd,
+                actual_flow,
+                predicted_flow,
+                weighted_error,
+                leak_probability,
+                reasoning,
+                upper_bound,
+                is_anomaly
+            )
+            VALUES (
+                s.dt,
+                s.blck_cd,
+                s.actual_flow,
+                s.predicted_flow,
+                s.weighted_error,
+                s.leak_probability,
+                s.reasoning,
+                s.upper_bound,
+                s.is_anomaly
+            )
+    """
+
+    rows = df[
+        [
+            'Time',
+            'blck_cd',
+            'Actual Flow',
+            'Predicted Flow',
+            'Weighted Error',
+            'Leak Probability',
+            'Reasoning',
+            'Upper Bound',
+            'Is Anomaly'
+        ]
+    ].values.tolist()
+
+    conn = get_connection()
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                execute_batch(
+                    cur,
+                    sql,
+                    rows,
+                    page_size=500
+                )
+    finally:
+        conn.close()
+
+    return len(rows)
+
+
+# =========================
+# 블록별 예측 분석
+# =========================
+
+def analyze_block(block_data, blck_cd, save_start_date, save_end_date):
+
+    model_path = MODEL_DIR / f"{blck_cd}.keras"
+    scaler_path = MODEL_DIR / f"{blck_cd}_scaler.pkl"
+
+    if not model_path.exists():
+
+        print(
+            f"[SKIP] model not found: {blck_cd} / {model_path}"
+        )
+
+        return pd.DataFrame()
+
+    if not scaler_path.exists():
+
+        print(
+            f"[SKIP] scaler not found: {blck_cd} / {scaler_path}"
+        )
+
+        return pd.DataFrame()
+
+    print(f"[LOAD MODEL] {blck_cd}")
+
+    model = tf.keras.models.load_model(
+        model_path
+    )
+
+    scaler = joblib.load(
+        scaler_path
+    )
+
+    scaled_data = apply_scaler(
+        block_data,
+        scaler
+    )
+
+    X_test, y_test, times_test, dates_test, blck_cds_test = create_sequences_prev_7_days(
+        scaled_data
+    )
+
+    if len(X_test) == 0:
+
+        print(
+            f"[SKIP] sequence not enough: {blck_cd}"
+        )
+
+        return pd.DataFrame()
+
+    y_pred = model.predict(
+        X_test,
+        verbose=0
+    )
+
+    y_test_inversed = inverse_scale_flow(
+        scaler,
+        y_test.reshape(-1, 1)
+    )
+
+    y_pred_inversed = inverse_scale_flow(
+        scaler,
+        y_pred
+    )
+
+    results = pd.DataFrame({
+        'Time': times_test,
+        'Date': dates_test,
+        'blck_cd': blck_cds_test,
+        'Actual Flow': y_test_inversed,
+        'Predicted Flow': y_pred_inversed
     })
 
+    metrics_df = calculate_datewise_metrics(
+        results
+    )
 
-metrics_df = calculate_datewise_metrics(results)
+    metrics_df = add_leak_probability_with_reasoning(
+        metrics_df
+    )
 
-# 결과 저장
-final_results = results.merge(metrics_df, on='Date', how='left')
+    final_results = results.merge(
+        metrics_df,
+        on=['blck_cd', 'Date'],
+        how='left'
+    )
 
-# 자릿수 수정
-final_results["Actual Flow"] = final_results["Actual Flow"].apply(lambda v: clamp_numeric(v, scale=1))
-final_results["Predicted Flow"] = final_results["Predicted Flow"].apply(lambda v: clamp_numeric(v, scale=1))
-final_results["Weighted Error"] = final_results["Weighted Error"].apply(lambda v: clamp_numeric(v, scale=2))
+    final_results = final_results[
+        (final_results['Time'] >= save_start_date)
+        & (final_results['Time'] <= save_end_date)
+    ].copy()
 
-#final_results.to_csv(OUTPUT_FILE, index=False)
+    if final_results.empty:
 
-#print("예측 결과 및 날짜별 평가지표가 포함된 CSV 파일이 생성되었습니다.")
+        print(
+            f"[SKIP] no result in target period: {blck_cd}"
+        )
 
+        return pd.DataFrame()
 
-# 특정 날짜의 실제값과 예측값을 비교하는 함수
-def plot_single_day_comparison(results, metrics_df, specific_date):
-    specific_date_data = results[results['Date'] == specific_date]
-    specific_metrics = metrics_df[metrics_df['Date'] == specific_date]['Weighted Error'].values[0]
+    final_results['Actual Flow'] = final_results[
+        'Actual Flow'
+    ].apply(
+        lambda v: clamp_numeric(v, max_abs=9999.9, scale=1)
+    )
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(specific_date_data['Time'], specific_date_data['Actual Flow'], label='Actual Flow', marker='o')
-    plt.plot(specific_date_data['Time'], specific_date_data['Predicted Flow'], label='Predicted Flow', marker='x')
+    final_results['Predicted Flow'] = final_results[
+        'Predicted Flow'
+    ].apply(
+        lambda v: clamp_numeric(v, max_abs=9999.9, scale=1)
+    )
 
-    plt.title(f'Flow Comparison on {specific_date}')
-    plt.xlabel('Time')
-    plt.ylabel('Flow')
-    plt.legend()
+    final_results['Weighted Error'] = final_results[
+        'Weighted Error'
+    ].apply(
+        lambda v: clamp_numeric(v, max_abs=9999.99, scale=2)
+    )
 
-    plt.text(0.95, 0.01, f"Weighted Error: {specific_metrics:.2f}%",
-             verticalalignment='bottom', horizontalalignment='right',
-             transform=plt.gca().transAxes,
-             color='red', fontsize=12, bbox=dict(facecolor='white', alpha=0.8))
+    final_results['Upper Bound'] = final_results[
+        'Upper Bound'
+    ].apply(
+        lambda v: clamp_numeric(v, max_abs=9999.99, scale=2)
+    )
 
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-
-# 특정 날짜 포함 7일간의 실제값과 예측값을 비교하는 함수
-def plot_seven_days_comparison(results, metrics_df, specific_date):
-    start_date = pd.to_datetime(specific_date) - pd.Timedelta(days=7)
-    seven_days_data = results[(results['Date'] >= start_date.date()) & (results['Date'] <= specific_date)]
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(seven_days_data['Time'], seven_days_data['Actual Flow'], label='Actual Flow', marker='o')
-    plt.plot(seven_days_data['Time'], seven_days_data['Predicted Flow'], label='Predicted Flow', marker='x')
-
-    plt.title(f'Flow Comparison from {start_date.date()} to {specific_date}')
-    plt.xlabel('Time')
-    plt.ylabel('Flow')
-    plt.legend()
-
-    unique_dates = seven_days_data['Date'].unique()
-    for date in unique_dates:
-        error = metrics_df[metrics_df['Date'] == date]['Weighted Error'].values[0]
-        date_data = seven_days_data[seven_days_data['Date'] == date]
-        middle_time = date_data['Time'].iloc[len(date_data) // 2]
-        plt.text(middle_time, plt.gca().get_ylim()[0] + 0.05 * (plt.gca().get_ylim()[1] - plt.gca().get_ylim()[0]),
-                 f"{error:.2f}%", color='red', fontsize=10,
-                 verticalalignment='bottom', horizontalalignment='center',
-                 bbox=dict(facecolor='white', alpha=0.8))
-
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+    return final_results
 
 
-# 날짜별 비교 그래프
-if not IS_BATCH:
-    specific_date = pd.to_datetime('2024-03-25').date()
-    plot_single_day_comparison(results, metrics_df, specific_date)
-    plot_seven_days_comparison(results, metrics_df, specific_date)
+# =========================
+# Main
+# =========================
 
-save_results(final_results)
-print(f"[RESULT] SUCCESS rows={len(final_results)}")
+def main():
+
+    args = parse_args()
+
+    schema = args.schema
+    start_date = args.start_date
+    end_date = args.end_date
+    blck_cd = args.blck_cd
+
+    #schema = "by_schema"
+    #start_date = "2024-01-01"
+    #end_date = "2024-03-17'
+    #blck_cd = "BL000073"
+
+    save_start_date = pd.to_datetime(
+        start_date
+    )
+
+    save_end_date = pd.to_datetime(
+        end_date
+    ) + pd.Timedelta(
+        hours=23,
+        minutes=59,
+        seconds=59
+    )
+
+    # 직전 7일 시퀀스 생성 + 과거 90일 정상상한선 계산을 위해
+    # 분석 시작일보다 97일 이전부터 조회
+    load_start_date = save_start_date - pd.Timedelta(
+        days=97
+    )
+
+    print("[START] AI ANALYSIS")
+    print(f"[SCHEMA] {schema}")
+    print(f"[PERIOD] {start_date} ~ {end_date}")
+    print(f"[LOAD_FROM] {load_start_date.date()}")
+    print(f"[BLOCK] {blck_cd if blck_cd else 'ALL'}")
+
+    data = load_source_data(
+        schema=schema,
+        start_dt=load_start_date,
+        end_dt=save_end_date,
+        blck_cd=blck_cd
+    )
+
+    if data.empty:
+
+        print(
+            "[RESULT] SUCCESS rows=0 reason=no_source_data"
+        )
+
+        return
+
+    data = preprocess_data(
+        data
+    )
+
+    all_results = []
+
+    for current_blck_cd, block_data in data.groupby(
+        'blck_cd'
+    ):
+
+        block_data = block_data.sort_values(
+            'time'
+        ).reset_index(drop=True)
+
+        result_df = analyze_block(
+            block_data=block_data,
+            blck_cd=current_blck_cd,
+            save_start_date=save_start_date,
+            save_end_date=save_end_date
+        )
+
+        if not result_df.empty:
+
+            all_results.append(
+                result_df
+            )
+
+    if len(all_results) == 0:
+
+        print(
+            "[RESULT] SUCCESS rows=0 reason=no_available_model_or_sequence"
+        )
+
+        return
+
+    final_df = pd.concat(
+        all_results,
+        ignore_index=True
+    )
+
+    saved_count = save_results(
+        schema,
+        final_df
+    )
+
+    print(
+        f"[RESULT] SUCCESS rows={saved_count}"
+    )
+
+
+if __name__ == "__main__":
+    main()
