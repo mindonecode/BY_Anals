@@ -95,7 +95,8 @@ def load_source_data(schema, start_dt, end_dt, blck_cd=None):
             dt as "time",
             blck_cd,
             flow,
-            temp as "temperature",
+            tmax,
+            tmin,
             rcvr_yn AS "leak_recovery"
         FROM {schema}.ai_anals_input
         WHERE dt >= %s
@@ -153,25 +154,11 @@ def preprocess_data(data):
         lambda x: 1 if x in kr_holidays else 0
     )
 
-    daily_temp = data.groupby(
-        ['blck_cd', 'date']
-    )['temperature'].agg(
-        tmax='max',
-        tmin='min'
-    ).reset_index()
-
-    data = data.merge(
-        daily_temp,
-        on=['blck_cd', 'date'],
-        how='left'
-    )
-
     data = data[
         [
             'time',
             'blck_cd',
             'flow',
-            'temperature',
             'leak_recovery',
             'tmax',
             'tmin',

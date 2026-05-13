@@ -37,7 +37,7 @@ def parse_args():
 
     parser.add_argument(
         "--schema",
-        required=False
+        required=True
     )
 
     parser.add_argument(
@@ -64,7 +64,8 @@ def load_train_data(schema, blck_cd):
             dt as "time",
             blck_cd,
             flow,
-            temp as "temperature",
+            tmax,
+            tmin,
             rcvr_yn AS "leak_recovery"
         FROM {schema}.ai_anals_input
         WHERE blck_cd = %s
@@ -105,19 +106,6 @@ def preprocess_data(data):
 
     data['is_holiday'] = data['date'].apply(
         lambda x: 1 if x in kr_holidays else 0
-    )
-
-    daily_temp = data.groupby(
-        ['blck_cd', 'date']
-    )['temperature'].agg(
-        tmax='max',
-        tmin='min'
-    ).reset_index()
-
-    data = data.merge(
-        daily_temp,
-        on=['blck_cd', 'date'],
-        how='left'
     )
 
     return data
@@ -455,7 +443,7 @@ history = model.fit(
     X_train,
     y_train,
 
-    epochs=50,
+    epochs=40,
 
     batch_size=32,
 
@@ -481,6 +469,12 @@ scaler_path = (
     MODEL_DIR
     / f"{BLCK_CD}_scaler.pkl"
 )
+
+if model_path.exists():
+    model_path.unlink()
+
+if scaler_path.exists():
+    scaler_path.unlink()
 
 model.save(model_path)
 
