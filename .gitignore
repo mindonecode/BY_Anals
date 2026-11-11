@@ -13,3 +13,4 @@ input/
 *.csv
 *.h5
 *.model
+models/
