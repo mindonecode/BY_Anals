@@ -1,5 +1,6 @@
 # Python
 venv/
+.venv/
 __pycache__/
 *.pyc
 
@@ -12,3 +13,4 @@ input/
 *.csv
 *.h5
 *.model
+models/
